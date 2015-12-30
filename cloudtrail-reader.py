@@ -1,16 +1,17 @@
 import gzip
 import json
 import boto3
+import os
 
-from steps import *
+from formatters import *
 
 
 
 s3 = boto3.resource("s3")
 sqs = boto3.resource("sqs")
-queue = sqs.get_queue_by_name(QueueName="ops-announce")
+queue = sqs.get_queue_by_name(QueueName=os.environ['SQS_QUEUE'])
 classes = globals()
-slack = slackweb.Slack(url="https://hooks.slack.com/services/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")
+slack = os.environ['SLACK_URL']
 
 while True:
     for message in queue.receive_messages():

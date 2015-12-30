@@ -1,12 +1,9 @@
 from collections import Counter, defaultdict
-import gzip
-import json
 import boto3
 
 import os
 import pprint
 
-import slackweb
 from pydblite import Base
 
 events = Counter()
@@ -95,8 +92,8 @@ class Inventory:
         return resource[0]["name"] if resource else None
 
 inv = Inventory(
-    "AKIAIOHYTIMXG67YIWSQ",
-    "MxcVT1X62LS2uoWlj3Jdo2a0uDBxLzmxxIVfnR6i")
+    os.environ["AWS_ACCESS_KEY_ID"],
+    os.environ["AWS_SECRET_ACCESS_KEY"])
 
 
 def skip(msg):
@@ -194,7 +191,8 @@ class MessageFormatter:
             "title": self.failure_title() if is_error else self.success_title(),
             "text": self.failure_text() if is_error else self.success_text(),
             "color": self.color() or ("warning" if is_error else None),
-            "fields": fields
+            "fields": fields,
+            "mrkdwn_in": ["text", "fields"]
         }
 
         return {k: v for k, v in attachment.items() if v is not None}
