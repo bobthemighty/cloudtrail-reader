@@ -1,17 +1,26 @@
+#!/bin/python
 import gzip
 import json
-import boto3
 import os
+
+import boto3
+import slackweb
 
 from formatters import *
 
 
+botosession = boto3.session.Session(
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    region_name=os.environ["AWS_REGION"]
+)
 
-s3 = boto3.resource("s3")
-sqs = boto3.resource("sqs")
+s3 = botosession.resource("s3")
+sqs = botosession.resource("sqs")
 queue = sqs.get_queue_by_name(QueueName=os.environ['SQS_QUEUE'])
 classes = globals()
-slack = os.environ['SLACK_URL']
+slack = slackweb.Slack(url=os.environ['SLACK_URL'])
+inventory = Inventory(botosession)
 
 while True:
     for message in queue.receive_messages():
@@ -22,7 +31,6 @@ while True:
         try:
             gz = gzip.GzipFile('/tmp/data.json.gz')
             data = json.loads(gz.read())
-            print(data)
         except Exception as e:
             print("Failed to read file ")
             continue
@@ -33,12 +41,11 @@ while True:
             if name+"Formatter" in classes:
                 clazz = classes[name+"Formatter"]
                 try:
-                    formatter = clazz(record)
+                    formatter = clazz(record, inventory)
                     slackmsg = formatter.format()
                 except Exception as e:
                     print(e)
                     pp.pprint(record)
-                    raise
                     continue
                 if slackmsg:
                     pass

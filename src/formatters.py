@@ -1,7 +1,4 @@
 from collections import Counter, defaultdict
-import boto3
-
-import os
 import pprint
 
 from pydblite import Base
@@ -15,8 +12,9 @@ pp = pprint.PrettyPrinter(indent=4)
 
 class Inventory:
 
-    def __init__(self, access_key, access_secret):
-        self.client = boto3.resource("ec2")
+    def __init__(self, session):
+        self.session = session
+        self.client = session.resource("ec2")
         self.create_database()
 
     def create_database(self):
@@ -91,43 +89,16 @@ class Inventory:
         resource = self.db(resource=id)
         return resource[0]["name"] if resource else None
 
-inv = Inventory(
-    os.environ["AWS_ACCESS_KEY_ID"],
-    os.environ["AWS_SECRET_ACCESS_KEY"])
-
 
 def skip(msg):
     pass
 
 
-def format_list(l):
-    return map(lambda s: "* "+s, l).join("\n")
+class MessageFormatter(object):
 
-
-def format_tags(l):
-    return "\n".join(map(lambda e: "* "+e["key"] + ":" + e["value"] + "\n", l))
-
-
-def user_and_ip(msg):
-    if "userName" in msg["userIdentity"]:
-        user = msg["userIdentity"]["userName"]
-        sourceip = msg["sourceIPAddress"]
-    else:
-        user = msg["userIdentity"]["arn"]
-        user = user.split("/")
-        user = user[-1]
-        sourceip = msg["sourceIPAddress"]
-
-    return user, sourceip
-
-
-def format_policy(doc):
-    return pp.pformat(doc)
-
-class MessageFormatter:
-
-    def __init__(self, msg):
+    def __init__(self, msg, inv):
         self.msg = msg
+        self.inv = inv
         self.build_user_and_ip()
         self.request = self.msg["requestParameters"] or defaultdict(str)
         self.response = self.msg["responseElements"]
@@ -180,7 +151,7 @@ class MessageFormatter:
         is_error = "errorMessage" in self.msg
         fields_source = self.failure_fields(
             ) if is_error else self.fields() or {}
-        fields = []
+        fields = [{"title": "time", "value": self.msg["eventTime"]}]
         for fieldset in fields_source:
             for k, v in fieldset.items():
                 fields.append({
@@ -197,22 +168,40 @@ class MessageFormatter:
 
         return {k: v for k, v in attachment.items() if v is not None}
 
+    def format_list(self, l):
+        return map(lambda s: "* "+s, l).join("\n")
 
-def instance_name(id):
-    instance = inv.get_instance(id)
-    if instance:
-        return "{} ({})".format(instance["name"], instance["env"])
-    return id
+    def format_tags(self, l):
+        return "\n".join(map(lambda e: "* "+e["key"] + ":" + e["value"] + "\n", l))
 
+    def user_and_ip(self, msg):
+        if "userName" in msg["userIdentity"]:
+            user = msg["userIdentity"]["userName"]
+            sourceip = msg["sourceIPAddress"]
+        else:
+            user = msg["userIdentity"]["arn"]
+            user = user.split("/")
+            user = user[-1]
+            sourceip = msg["sourceIPAddress"]
 
-def resource_name(id):
-    name = inv.get_resource_name(id)
-    return name or id
+        return user, sourceip
 
+    def format_policy(self, doc):
+        return pp.pformat(doc)
 
-def group_name(id):
-    group = inv.get_security_group(id)
-    return group["name"] if group else id
+    def instance_name(self, id):
+        instance = self.inv.get_instance(id)
+        if instance:
+            return "{} ({})".format(instance["name"], instance["env"])
+        return id
+
+    def resource_name(self, id):
+        name = self.inv.get_resource_name(id)
+        return name or id
+
+    def group_name(self, id):
+        group = self.inv.get_security_group(id)
+        return group["name"] if group else id
 
 
 class TerminateInstancesFormatter(MessageFormatter):
@@ -226,7 +215,7 @@ class TerminateInstancesFormatter(MessageFormatter):
 
         for instance in self.response["instancesSet"]["items"]:
             self.instances.append("* {} (was {})".format(
-                instance_name(instance["instanceId"]),
+                self.instance_name(instance["instanceId"]),
                 instance["previousState"]["name"]))
 
     def success_title(self):
@@ -277,7 +266,7 @@ class CreateTagsFormatter(MessageFormatter):
     def build(self):
         self.resources = [
             "* " +
-            resource_name(r["resourceId"])
+            self.resource_name(r["resourceId"])
             for r in self.msg["requestParameters"]["resourcesSet"]["items"]]
         self.tags = {t["key"]: (t["value"] if "value" in t else "")
                      for t in self.msg["requestParameters"]["tagSet"]["items"]}
@@ -364,7 +353,7 @@ class RunInstancesFormatter(MessageFormatter):
         else:
             self.instances = [
                 "* {} ({})".format(
-                    instance_name(item["instanceId"]),
+                    self.instance_name(item["instanceId"]),
                     item["networkInterfaceSet"]["items"][0]["privateIpAddress"])
                 for item in self.response["instancesSet"]["items"]]
 
@@ -491,7 +480,7 @@ class RegisterInstancesWithLoadBalancerFormatter(MessageFormatter):
     def build(self):
         self.lb = self.msg["requestParameters"]["loadBalancerName"]
         self.instances = [
-            "* " + instance_name(instance["instanceId"])
+            "* " + self.instance_name(instance["instanceId"])
             for instance in self.msg["requestParameters"]["instances"]]
 
 
@@ -529,7 +518,7 @@ class ModifyInstanceAttributeFormatter(MessageFormatter):
         atts = {}
         for p, v in self.msg["requestParameters"].items():
             if p == "instanceId":
-                atts[p] = instance_name(v)
+                atts[p] = self.instance_name(v)
             else:
                 atts[p] = v["value"]
 
@@ -573,7 +562,7 @@ class StopInstancesFormatter(MessageFormatter):
         if self.response is not None:
             for instance in self.response["instancesSet"]["items"]:
                 self.instances.append("* {} (was {})".format(
-                    instance_name(instance["instanceId"]),
+                    self.instance_name(instance["instanceId"]),
                     instance["previousState"]["name"]
                 ))
         else:
@@ -602,9 +591,9 @@ class SecurityGroupsModifiedFormatter(MessageFormatter):
 
     def build(self):
         interface_id = self.request["networkInterfaceId"]
-        interface = inv.get_network_interface(interface_id)
+        interface = self.inv.get_network_interface(interface_id)
         self.interface_name = interface["name"] if interface else interface_id
-        self.groups = ["* "+group_name(g["groupId"])
+        self.groups = ["* "+self.group_name(g["groupId"])
                        for g in self.request["groupSet"]["items"]]
 
 
@@ -625,7 +614,7 @@ class NetworkInterfaceModifiedFormatter(MessageFormatter):
 
     def build(self):
         interface_id = self.request["networkInterfaceId"]
-        interface = inv.get_network_interface(interface_id)
+        interface = self.inv.get_network_interface(interface_id)
         self.interface_name = interface["name"] if interface else interface_id
 
 
@@ -636,9 +625,9 @@ class ModifyNetworkInterfaceAttributeFormatter(MessageFormatter):
 
     def build(self):
         if self.is_sg_modification():
-            self.inner = SecurityGroupsModifiedFormatter(self.msg)
+            self.inner = SecurityGroupsModifiedFormatter(self.msg, self.inv)
         else:
-            self.inner = NetworkInterfaceModifiedFormatter(self.msg)
+            self.inner = NetworkInterfaceModifiedFormatter(self.msg, self.inv)
         self.inner.build()
 
     def format(self):
@@ -684,7 +673,7 @@ class AuthorizeSecurityGroupIngressFormatter(MessageFormatter):
     def success_text(self):
         return "User {} updated the group {}. New ruleset follows:\n{}".format(
             self.user,
-            group_name(self.groupid),
+            self.group_name(self.groupid),
             self.format_group()
         )
 
@@ -695,7 +684,7 @@ class AuthorizeSecurityGroupIngressFormatter(MessageFormatter):
         return "User {} failed to update the group {}\
                 with the following rules:\n{}".format(
             self.user,
-            group_name(self.groupid),
+            self.group_name(self.groupid),
             self.format_group()
         )
 
@@ -712,7 +701,7 @@ class AuthorizeSecurityGroupIngressFormatter(MessageFormatter):
 
             if "items" in p["groups"]:
                 for g in p["groups"]["items"]:
-                    rule.append("* "+group_name(g["groupId"]))
+                    rule.append("* "+self.group_name(g["groupId"]))
 
             if "items" in p["ipRanges"]:
                 for r in p["ipRanges"]["items"]:
@@ -722,10 +711,6 @@ class AuthorizeSecurityGroupIngressFormatter(MessageFormatter):
 
     def build(self):
         self.groupid = self.request["groupId"]
-
-
-class RevokeSecurityGroupIngressFormatter(AuthorizeSecurityGroupIngressFormatter):
-    pass
 
 
 class CreateUserFormatter(MessageFormatter):
@@ -754,7 +739,7 @@ class AddUserToGroupFormatter(MessageFormatter):
         return "Failed to add {} to group {}".format(self.username, self.groupname)
 
     def fields(self):
-        return [{"Added by":self.user}]
+        return [{"Added by": self.user}]
 
     def build(self):
         self.username = self.request["userName"]
@@ -777,8 +762,8 @@ class DeregisterInstancesFromLoadBalancerFormatter(MessageFormatter):
 
     def build(self):
         self.elb = self.request["loadBalancerName"]
-        self.instances = [instance_name(i["instanceId"])
-                                        for i in self.request["instances"]]
+        self.instances = [self.instance_name(i["instanceId"])
+                          for i in self.request["instances"]]
         self.instance_count = len(self.instances)
 
     def success_text(self):
@@ -818,7 +803,7 @@ class CreateSecurityGroupFormatter(MessageFormatter):
         self.groupname = self.request["groupName"]
         if self.response:
             id = self.response["groupId"]
-            inv.add_group(id, self.groupname)
+            self.inv.add_group(id, self.groupname)
 
 
 class UploadServerCertificateFormatter(MessageFormatter):
@@ -891,9 +876,9 @@ class CreateLoadBalancerListenersFormatter(MessageFormatter):
 
     def build(self):
         self.ports = ["* {}=>{} ({})".format(
-                        p["loadBalancerPort"],
-                        p["instancePort"],
-                        p["instanceProtocol"])
+                      p["loadBalancerPort"],
+                      p["instancePort"],
+                      p["instanceProtocol"])
                       for p in self.request["listeners"]]
         self.elb = self.request["loadBalancerName"]
 
@@ -908,6 +893,29 @@ class CreateAccessKeyFormatter(MessageFormatter):
 
     def success_text(self):
         return "{} created a new access key with id {}".format(
+            self.user,
+            self.access_key_id
+        )
+
+    def build(self):
+        self.username = self.request["userName"]
+        if self.response:
+            self.access_key_id = self.response["accessKey"]["accessKeyId"]
+
+
+class DeleteAccessKeyFormatter(MessageFormatter):
+
+    def success_title(self):
+        return "Access key deleted for {}".format(self.username)
+
+    def failure_text(self):
+        return "Failed to delete access key {} for {}".format(
+            self.access_key_id,
+            self.username
+        )
+
+    def success_text(self):
+        return "{} deletted the access key with id {}".format(
             self.user,
             self.access_key_id
         )
@@ -1000,7 +1008,6 @@ class AcceptVpcPeeringConnectionFormatter(MessageFormatter):
         self.vpc_pxid = self.request["vpcPeeringConnectionId"]
 
 
-
 class ConfigureHealthCheckFormatter(MessageFormatter):
 
     def success_title(self):
@@ -1014,14 +1021,14 @@ class ConfigureHealthCheckFormatter(MessageFormatter):
 
     def fields(self):
         return [
-                {"user":self.user},
-                self.request["healthCheck"]
+            {"user": self.user},
+            self.request["healthCheck"]
         ]
 
     def failure_fields(self):
         return [
-                self.default_failure_fields,
-                self.request["healthCheck"]
+            self.default_failure_fields,
+            self.request["healthCheck"]
         ]
 
 
@@ -1043,9 +1050,8 @@ class RebootInstancesFormatter(MessageFormatter):
             "\n".join(self.instances)
         )
 
-
     def build(self):
-        self.instances = ["* "+instance_name(i["instanceId"])
+        self.instances = ["* "+self.instance_name(i["instanceId"])
                           for i in self.request["instancesSet"]["items"]
                           ]
         self.instance_count = len(self.instances)
@@ -1090,18 +1096,18 @@ class SetLoadBalancerPoliciesOfListenerFormatter(MessageFormatter):
 
     def fields(self):
         return [{
-            'user':self.user,
+            'user': self.user,
             'loadbalancer': self.loadbalancer,
             'groups': self.groups
         }]
 
     def failure_fields(self):
         return [
-                self.default_failure_fields,
-                {
-                    'loadbalancer': self.loadbalancer,
-                    'groups': self.groups
-                }]
+            self.default_failure_fields,
+            {
+                'loadbalancer': self.loadbalancer,
+                'groups': self.groups
+            }]
 
     def build(self):
         self.loadbalancer = '{}:{}'.format(
@@ -1148,7 +1154,7 @@ class PutRolePolicyFormatter(MessageFormatter):
             self.user,
             self.policy,
             self.role,
-            format_policy(self.request["policyDocument"])
+            self.format_policy(self.request["policyDocument"])
         )
 
     def failure_text(self):
@@ -1156,7 +1162,7 @@ class PutRolePolicyFormatter(MessageFormatter):
             self.user,
             self.policy,
             self.role,
-            format_policy(self.request["policyDocument"])
+            self.format_policy(self.request["policyDocument"])
         )
 
     def build(self):
@@ -1272,7 +1278,7 @@ class PutUserPolicyFormatter(MessageFormatter):
             self.user,
             self.policy,
             self.targetuser,
-            format_policy(self.request['policyDocument'])
+            self.format_policy(self.request['policyDocument'])
         )
 
     def failure_text(self):
@@ -1280,7 +1286,7 @@ class PutUserPolicyFormatter(MessageFormatter):
             self.user,
             self.policy,
             self.targetuser,
-            format_policy(self.request['policyDocument'])
+            self.format_policy(self.request['policyDocument'])
         )
 
     def build(self):
@@ -1301,7 +1307,7 @@ class PutGroupPolicyFormatter(MessageFormatter):
             self.user,
             self.policy,
             self.targetuser,
-            format_policy(self.request['policyDocument'])
+            self.format_policy(self.request['policyDocument'])
         )
 
     def failure_text(self):
@@ -1309,7 +1315,7 @@ class PutGroupPolicyFormatter(MessageFormatter):
             self.user,
             self.policy,
             self.targetuser,
-            format_policy(self.request['policyDocument'])
+            self.format_policy(self.request['policyDocument'])
         )
 
     def build(self):
@@ -1326,11 +1332,10 @@ class RebootDBInstanceFormatter(MessageFormatter):
         return "Failed to reboot db instance "+self.db
 
     def fields(self):
-        return [{'user': self.user, 'failover':self.request['forceFailover']}]
+        return [{'user': self.user, 'failover': self.request['forceFailover']}]
 
     def build(self):
         self.db = self.request['dBInstanceIdentifier']
-
 
 
 class ModifyDBParameterGroupFormatter(MessageFormatter):
@@ -1364,7 +1369,7 @@ class AttachGroupPolicy(MessageFormatter):
         }]
 
     def failure_fields(self):
-        return [self.default_failure_fields,{
+        return [self.default_failure_fields, {
             "group": self.request["groupName"],
             "policy": self.request["policyArn"]
         }]
@@ -1392,7 +1397,7 @@ class ApplySecurityGroupsToLoadBalancerFormatter(MessageFormatter):
 
     def build(self):
         self.groups = "\n".join([
-            "* "+group_name(g) for g in self.request["securityGroups"]
+            "* "+self.group_name(g) for g in self.request["securityGroups"]
         ])
         self.elb = self.request['loadBalancerName']
 
@@ -1440,10 +1445,9 @@ class RestoreDBInstanceToPointInTime(MessageFormatter):
 
     def fields(self):
         return [
-                {'user':self.user},
-                self.request
+            {'user': self.user},
+            self.request
         ]
 
     def failure_fields(self):
         return [self.default_failure_fields, self.request]
-
