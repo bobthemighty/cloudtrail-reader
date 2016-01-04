@@ -2,6 +2,7 @@
 import gzip
 import json
 import os
+from time import sleep
 
 import boto3
 import slackweb
@@ -32,7 +33,7 @@ while True:
             gz = gzip.GzipFile('/tmp/data.json.gz')
             data = json.loads(gz.read())
         except Exception as e:
-            print("Failed to read file ")
+            print("Failed to read file "+key)
             continue
         for record in data["Records"]:
             name = record["eventName"]
@@ -48,10 +49,13 @@ while True:
                     pp.pprint(record)
                     continue
                 if slackmsg:
-                    pass
                     pp.pprint(slackmsg)
+                    if slackmsg.user.endswith("@autoscaling.amazonaws.com"):
+                        continue
                     slack.notify(attachments=[slackmsg])
             else:
                 print("need formatter for "+name)
                 pp.pprint(record)
         message.delete()
+
+    sleep(30)
